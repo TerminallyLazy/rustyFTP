@@ -5,11 +5,13 @@ use std::path::Path;
 use std::time::Duration;
 use thiserror::Error;
 use tokio::time::sleep;
-use chrono::{DateTime, Utc, TimeZone};
+use chrono::{DateTime, Utc};
 use redis::aio::Connection as RedisConnection;
 use backoff::{ExponentialBackoff, retry};
 use futures::StreamExt;
 use tokio_util::compat::TokioAsyncReadCompatExt;
+use std::future::Future;
+use std::pin::Pin;
 
 const MAX_RETRY_DELAY: Duration = Duration::from_secs(60);
 
@@ -73,16 +75,14 @@ impl FtpClient {
 
         tokio::time::timeout(Duration::from_secs(30), connect_future)
             .await
-            .map_err(|_| FtpError::IoError(std::io::Error::new(std::io::ErrorKind::TimedOut, "FTP connection timed out")))
-            .and_then(|result| result)
+            .map_err(|_| FtpError::IoError(std::io::Error::new(std::io::ErrorKind::TimedOut, "FTP connection timed out")))?
     }
 
     async fn check_file_timestamp(&self, ftp_stream: &mut async_ftp::FtpStream) -> Result<bool, FtpError> {
         let file_path = self.file_path.clone();
-        let modified_time: i64 = ftp_stream.mdtm(&file_path).await.map_err(FtpError::FtpError)?;
+        let modified_time: i64 = ftp_stream.mdtm(&file_path).await?;
 
-        let modified_datetime = Utc.timestamp_opt(modified_time, 0)
-            .single()
+        let modified_datetime = chrono::DateTime::<Utc>::from_timestamp(modified_time, 0)
             .ok_or_else(|| FtpError::IoError(std::io::Error::new(std::io::ErrorKind::InvalidData, "Invalid timestamp")))?;
 
         let mut last_checked = self.last_checked.lock()
@@ -141,14 +141,11 @@ impl FtpClient {
         let mut record_count = 0;
 
         while let Some(result) = csv_reader.deserialize::<Vec<String>>().next().await {
-            let record = result.map_err(FtpError::CsvError)?;
+            let record = result?;
             record_count += 1;
             info!("Processing record {}", record_count);
 
-            if let Err(e) = self.push_to_redis(redis_conn, record).await {
-                error!("Failed to push record {} to Redis: {:?}", record_count, e);
-                return Err(e);
-            }
+            self.push_to_redis(redis_conn, record).await?;
         }
 
         info!("Successfully processed {} CSV records", record_count);
@@ -169,7 +166,7 @@ impl FtpClient {
                     Ok(Ok(conn)) => Ok(conn),
                     Ok(Err(e)) => {
                         error!("Redis connection error: {:?}", e);
-                        Err(backoff::Error::Transient(FtpError::RedisError(e)))
+                        Err(backoff::Error::transient(FtpError::RedisError(e)))
                     },
                     Err(_) => {
                         let e = redis::RedisError::from(std::io::Error::new(
@@ -177,7 +174,7 @@ impl FtpClient {
                             format!("Redis connection timed out after {:?}", REDIS_TIMEOUT),
                         ));
                         error!("Redis connection timeout: {:?}", e);
-                        Err(backoff::Error::Transient(FtpError::RedisError(e)))
+                        Err(backoff::Error::transient(FtpError::RedisError(e)))
                     }
                 }
             }
@@ -253,7 +250,7 @@ async fn process_ftp_and_redis(ftp_client: &FtpClient) -> Result<(), FtpError> {
     retry(backoff, || {
         let ftp_client = ftp_client.clone();
         async move {
-            match tokio::time::timeout(
+            tokio::time::timeout(
                 INITIAL_TIMEOUT,
                 async {
                     let mut ftp_stream = ftp_client.connect().await?;
@@ -267,29 +264,19 @@ async fn process_ftp_and_redis(ftp_client: &FtpClient) -> Result<(), FtpError> {
                 },
             )
             .await
-            {
-                Ok(Ok(_)) => Ok(()),
-                Ok(Err(e)) => {
-                    error!("Operation failed: {}", e);
-                    Err(backoff::Error::Transient(e))
-                }
-                Err(_) => {
-                    let e = FtpError::IoError(std::io::Error::new(
-                        std::io::ErrorKind::TimedOut,
-                        "Operation timed out",
-                    ));
-                    error!("Operation timed out");
-                    Err(backoff::Error::Transient(e))
-                }
-            }
+            .map_err(|_| {
+                let e = FtpError::IoError(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "Operation timed out",
+                ));
+                error!("Operation timed out");
+                e
+            })?
         }
     })
     .await
     .map_err(|e| match e {
-        backoff::Error::Permanent(e) | backoff::Error::Transient(e) => {
-            error!("All retry attempts failed: {}", e);
-            e
-        }
+        backoff::Error::Transient(e) | backoff::Error::Permanent(e) => e,
     })
 }
 
