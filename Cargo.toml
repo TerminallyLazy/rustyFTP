@@ -1,0 +1,20 @@
+[package]
+name = "rustyFTP"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+dotenv = "0.15.0"
+async_ftp = "5.0.0"
+csv = "1.1"
+csv-async = "1.2"
+redis = { version = "0.22.1", features = ["aio", "tokio-comp"] }
+log = "0.4"
+env_logger = "0.9"
+tokio = { version = "1", features = ["full"] }
+thiserror = "1.0"
+backoff = { version = "0.4", features = ["futures"] }
+futures = "0.3"
+chrono = "0.4"
+async-trait = "0.1"
+tokio-util = { version = "0.7", features = ["compat"] }
