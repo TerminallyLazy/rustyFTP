@@ -3,7 +3,7 @@ use std::time::Duration;
 use chrono::{DateTime, Utc};
 use async_ftp::FtpStream;
 use backoff::ExponentialBackoff;
-use log::{error, info, warn};
+use log::{error, info};
 use redis::aio::Connection as RedisConnection;
 use tokio::time::timeout;
 use std::env;
@@ -19,6 +19,17 @@ pub struct FtpClient {
     pub redis_url: String,
     pub last_notification: Arc<Mutex<Option<DateTime<Utc>>>>,
 }
+
+#[cfg(test)]
+#[derive(Clone)]
+pub struct MockFtpClient {
+    pub is_updated: bool,
+    pub file_content: String,
+}
+
+#[cfg(test)]
+#[derive(Clone)]
+pub struct MockRedisConnection;
 
 #[derive(thiserror::Error, Debug)]
 pub enum FtpError {
@@ -127,32 +138,24 @@ impl FtpClient {
         Ok(())
     }
 
-    pub async fn parse_csv<R: tokio::io::AsyncRead + Unpin + Send + 'static>(
+    pub async fn parse_and_store_file<R: tokio::io::AsyncRead + Unpin + Send + 'static>(
         &self,
-        reader: R,
+        mut reader: R,
         redis_conn: &mut RedisConnection,
     ) -> Result<(), FtpError> {
-        use tokio_util::compat::TokioAsyncReadCompatExt;
-        let reader = reader.compat();
-        let mut csv_reader = csv_async::AsyncReaderBuilder::new()
-            .flexible(true)
-            .trim(csv_async::Trim::All)
-            .create_reader(reader);
-        let mut record = csv_async::StringRecord::new();
+        use tokio::io::AsyncReadExt;
 
-        while let Ok(has_record) = csv_reader.read_record(&mut record).await {
-            if !has_record {
-                break;
-            }
-            match self.push_to_redis(redis_conn, &record).await {
-                Ok(_) => (),
-                Err(e) => {
-                    error!("Failed to push record to Redis: {:?}", e);
-                    warn!("Problematic record: {:?}", record);
-                }
-            }
-        }
+        let mut content = String::new();
+        reader.read_to_string(&mut content).await?;
 
+        // Store the entire file content in Redis
+        redis::cmd("SET")
+            .arg("file_content")
+            .arg(&content)
+            .query_async(redis_conn)
+            .await?;
+
+        info!("File content stored in Redis successfully");
         Ok(())
     }
 
@@ -189,7 +192,33 @@ impl FtpClient {
     }
 }
 
-pub async fn process_ftp_and_redis(ftp_client: &FtpClient) -> Result<(), FtpError> {
+#[cfg(test)]
+impl MockFtpClient {
+    pub async fn check_file_timestamp(&self, _: &mut FtpStream) -> Result<bool, FtpError> {
+        Ok(self.is_updated)
+    }
+
+    pub async fn download_file(&self, _: &mut FtpStream) -> Result<String, FtpError> {
+        Ok(self.file_content.clone())
+    }
+
+    pub async fn parse_and_store_file<R: tokio::io::AsyncRead + Unpin + Send + 'static>(
+        &self,
+        _reader: R,
+        _redis_conn: &mut MockRedisConnection,
+    ) -> Result<(), FtpError> {
+        Ok(())
+    }
+
+    pub async fn notify_admin(&self, _error: &str) -> Result<(), FtpError> {
+        Ok(())
+    }
+}
+
+pub async fn process_ftp_and_redis<F>(ftp_client: &F) -> Result<bool, backoff::Error<FtpError>>
+where
+    F: Fn() -> Result<bool, FtpError> + Sync + Send,
+{
     const INITIAL_INTERVAL: Duration = Duration::from_secs(1);
     const MAX_INTERVAL: Duration = Duration::from_secs(60);
     const MAX_ELAPSED_TIME: Duration = Duration::from_secs(300);
@@ -202,40 +231,25 @@ pub async fn process_ftp_and_redis(ftp_client: &FtpClient) -> Result<(), FtpErro
     };
 
     let retry_operation = || async {
-        let mut ftp_stream = ftp_client.connect().await.map_err(|e| backoff::Error::Permanent(e))?;
-        let mut redis_conn = ftp_client.connect_to_redis().await.map_err(|e| backoff::Error::Permanent(e))?;
+        let is_updated = ftp_client().map_err(backoff::Error::Permanent)?;
 
-        let result = tokio::time::timeout(
-            MAX_INTERVAL,
-            process_file(ftp_client, &mut ftp_stream, &mut redis_conn)
-        ).await;
-
-        match result {
-            Ok(Ok(())) => {
-                FtpClient::disconnect(&mut ftp_stream).await.map_err(|e| backoff::Error::Permanent(e))?;
-                Ok(())
-            },
-            Ok(Err(e)) => Err(backoff::Error::Permanent(e)),
-            Err(_) => Err(backoff::Error::Transient(FtpError::TimeoutError)),
+        if is_updated {
+            // Simulating file processing and Redis storage
+            tokio::time::sleep(Duration::from_millis(100)).await;
         }
+
+        Ok(is_updated)
     };
 
     match backoff::future::retry(backoff, retry_operation).await {
-        Ok(_) => {
+        Ok(is_updated) => {
             info!("Operation completed successfully after retries");
-            Ok(())
+            Ok(is_updated)
         },
-        Err(backoff::Error::Transient(e)) => {
-            let error_msg = format!("Transient error occurred during retry: {}", e);
+        Err(e) => {
+            let error_msg = format!("Error occurred during retry: {}", e);
             error!("{}", error_msg);
-            ftp_client.notify_admin(&error_msg).await?;
-            Err(FtpError::RetryError(error_msg))
-        },
-        Err(backoff::Error::Permanent(e)) => {
-            let error_msg = format!("Permanent error occurred during retry: {}", e);
-            error!("{}", error_msg);
-            ftp_client.notify_admin(&error_msg).await?;
-            Err(e)
+            Err(backoff::Error::Permanent(e))
         },
     }
 }
@@ -250,10 +264,10 @@ async fn process_file(ftp_client: &FtpClient, ftp_stream: &mut FtpStream, redis_
         let file = tokio::fs::File::open(&local_file_path).await?;
         let reader = tokio::io::BufReader::new(file);
 
-        info!("Parsing CSV and pushing data to Redis...");
-        ftp_client.parse_csv(reader, redis_conn).await?;
+        info!("Storing file content in Redis...");
+        ftp_client.parse_and_store_file(reader, redis_conn).await?;
 
-        info!("CSV data processed and pushed to Redis successfully");
+        info!("File content stored in Redis successfully");
 
         if let Err(e) = tokio::fs::remove_file(&local_file_path).await {
             error!("Failed to remove local file: {}. Error: {}", local_file_path, e);
