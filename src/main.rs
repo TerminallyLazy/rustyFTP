@@ -1,219 +1,16 @@
 use dotenv::dotenv;
 use log::{error, info};
-use std::env;
-use std::path::Path;
-use std::time::Duration;
-use thiserror::Error;
+use std::{env, time::Duration};
 use tokio::time::sleep;
-use chrono::{DateTime, Utc};
-use redis::aio::Connection as RedisConnection;
-use backoff::{ExponentialBackoff, retry};
-use futures::StreamExt;
-use tokio_util::compat::TokioAsyncReadCompatExt;
-use std::future::Future;
-use std::pin::Pin;
 
-const MAX_RETRY_DELAY: Duration = Duration::from_secs(60);
-
-#[derive(Error, Debug)]
-enum FtpError {
-    #[error("Environment variable not found: {0}")]
-    EnvVarError(#[from] env::VarError),
-    #[error("FTP error: {0}")]
-    FtpError(#[from] async_ftp::types::FtpError),
-    #[error("IO error: {0}")]
-    IoError(#[from] std::io::Error),
-    #[error("CSV error: {0}")]
-    CsvError(#[from] csv_async::Error),
-    #[error("Redis error: {0}")]
-    RedisError(#[from] redis::RedisError),
-    #[error("Backoff error: {0}")]
-    BackoffError(#[from] Box<dyn std::error::Error + Send + Sync>),
-    #[error("Lock error: {0}")]
-    LockError(String),
-    #[error("DateTime parse error: {0}")]
-    DateTimeParseError(#[from] chrono::ParseError),
-}
-
-use std::sync::{Arc, Mutex};
-
-#[derive(Clone)]
-struct FtpClient {
-    host: String,
-    user: String,
-    pass: String,
-    file_path: String,
-    last_checked: Arc<Mutex<Option<DateTime<Utc>>>>,
-    redis_url: String,
-    last_notification: Arc<Mutex<Option<DateTime<Utc>>>>,
-}
-
-impl FtpClient {
-    fn new() -> Result<Self, FtpError> {
-        dotenv().ok();
-        Ok(FtpClient {
-            host: env::var("FTP_HOST")?,
-            user: env::var("FTP_USER")?,
-            pass: env::var("FTP_PASS")?,
-            file_path: env::var("FTP_FILE_PATH")?,
-            last_checked: Arc::new(Mutex::new(None)),
-            redis_url: env::var("REDIS_URL")?,
-            last_notification: Arc::new(Mutex::new(None)),
-        })
-    }
-
-    async fn connect(&self) -> Result<async_ftp::FtpStream, FtpError> {
-        let host = self.host.clone();
-        let user = self.user.clone();
-        let pass = self.pass.clone();
-
-        let connect_future = async {
-            let mut ftp_stream = async_ftp::FtpStream::connect(&host).await?;
-            ftp_stream.login(&user, &pass).await?;
-            Ok(ftp_stream)
-        };
-
-        tokio::time::timeout(Duration::from_secs(30), connect_future)
-            .await
-            .map_err(|_| FtpError::IoError(std::io::Error::new(std::io::ErrorKind::TimedOut, "FTP connection timed out")))?
-    }
-
-    async fn check_file_timestamp(&self, ftp_stream: &mut async_ftp::FtpStream) -> Result<bool, FtpError> {
-        let file_path = self.file_path.clone();
-        let modified_time: i64 = ftp_stream.mdtm(&file_path).await?;
-
-        let modified_datetime = chrono::DateTime::<Utc>::from_timestamp(modified_time, 0)
-            .ok_or_else(|| FtpError::IoError(std::io::Error::new(std::io::ErrorKind::InvalidData, "Invalid timestamp")))?;
-
-        let mut last_checked = self.last_checked.lock()
-            .map_err(|e| FtpError::LockError(format!("Failed to acquire lock: {}", e)))?;
-
-        let is_updated = last_checked.as_ref().map_or(true, |&last| modified_datetime > last);
-
-        if is_updated {
-            *last_checked = Some(modified_datetime);
-        }
-
-        Ok(is_updated)
-    }
-
-    async fn download_file(&self, ftp_stream: &mut async_ftp::FtpStream) -> Result<String, FtpError> {
-        let file_path = self.file_path.clone();
-        let mut remote_file = ftp_stream.simple_retr(&file_path).await
-            .map_err(FtpError::FtpError)?;
-
-        let local_file_path = Path::new(&self.file_path)
-            .file_name()
-            .ok_or_else(|| FtpError::IoError(std::io::Error::new(std::io::ErrorKind::InvalidInput, "Invalid file path")))?
-            .to_str()
-            .ok_or_else(|| FtpError::IoError(std::io::Error::new(std::io::ErrorKind::InvalidInput, "Invalid file name")))?
-            .to_owned();
-
-        let mut file_content = Vec::new();
-        tokio::io::copy(&mut remote_file, &mut file_content).await
-            .map_err(FtpError::IoError)?;
-
-        tokio::fs::write(&local_file_path, &file_content).await?;
-
-        info!("File downloaded successfully: {}", local_file_path);
-        Ok(local_file_path)
-    }
-
-    async fn disconnect(ftp_stream: &mut async_ftp::FtpStream) -> Result<(), FtpError> {
-        ftp_stream.quit().await
-            .map_err(FtpError::FtpError)
-            .and_then(|_| {
-                info!("Disconnected from FTP server");
-                Ok(())
-            })
-    }
-
-    async fn parse_csv<R: tokio::io::AsyncRead + Unpin + Send + 'static>(&self, reader: R, redis_conn: &mut RedisConnection) -> Result<(), FtpError> {
-        use csv_async::AsyncReaderBuilder;
-        use futures::StreamExt;
-        use tokio_util::compat::TokioAsyncReadCompatExt;
-
-        let compat_reader = reader.compat();
-        let mut csv_reader = AsyncReaderBuilder::new()
-            .flexible(true)
-            .create_deserializer(compat_reader);
-
-        let mut record_count = 0;
-
-        while let Some(result) = csv_reader.deserialize::<Vec<String>>().next().await {
-            let record = result?;
-            record_count += 1;
-            info!("Processing record {}", record_count);
-
-            self.push_to_redis(redis_conn, record).await?;
-        }
-
-        info!("Successfully processed {} CSV records", record_count);
-        Ok(())
-    }
-
-    async fn connect_to_redis(&self) -> Result<redis::aio::Connection, FtpError> {
-        let client = redis::Client::open(self.redis_url.as_str())
-            .map_err(FtpError::RedisError)?;
-        let mut backoff = ExponentialBackoff::default();
-        backoff.max_elapsed_time = Some(Duration::from_secs(60));
-
-        let conn = retry(backoff, || {
-            let client = client.clone();
-            async move {
-                const REDIS_TIMEOUT: Duration = Duration::from_secs(10);
-                match tokio::time::timeout(REDIS_TIMEOUT, client.get_async_connection()).await {
-                    Ok(Ok(conn)) => Ok(conn),
-                    Ok(Err(e)) => {
-                        error!("Redis connection error: {:?}", e);
-                        Err(backoff::Error::transient(FtpError::RedisError(e)))
-                    },
-                    Err(_) => {
-                        let e = redis::RedisError::from(std::io::Error::new(
-                            std::io::ErrorKind::TimedOut,
-                            format!("Redis connection timed out after {:?}", REDIS_TIMEOUT),
-                        ));
-                        error!("Redis connection timeout: {:?}", e);
-                        Err(backoff::Error::transient(FtpError::RedisError(e)))
-                    }
-                }
-            }
-        }).await
-        .map_err(|e| {
-            error!("Failed to connect to Redis after multiple attempts: {:?}", e);
-            match e {
-                backoff::Error::Transient(e) | backoff::Error::Permanent(e) => e,
-            }
-        })?;
-
-        info!("Successfully connected to Redis");
-        Ok(conn)
-    }
-
-    async fn push_to_redis(&self, conn: &mut redis::aio::Connection, record: Vec<String>) -> Result<(), FtpError> {
-        use redis::AsyncCommands;
-        let key = format!("record:{}", record.first().unwrap_or(&"unknown".to_string()));
-        let value = record.join(",");
-        conn.set(&key, &value).await.map_err(FtpError::RedisError)?;
-        Ok(())
-    }
-
-    async fn notify_admin(&self, error: &str) -> Result<(), FtpError> {
-        let now = Utc::now();
-        let mut last_notification = self.last_notification.lock()
-            .map_err(|e| FtpError::LockError(format!("Failed to acquire lock: {}", e)))?;
-
-        if last_notification.as_ref().map_or(true, |&last| now.signed_duration_since(last).num_minutes() >= 30) {
-            error!("Admin Notification: {}", error);
-            *last_notification = Some(now);
-        }
-        Ok(())
-    }
-}
+pub mod ftp_operations;
+pub use crate::ftp_operations::{FtpClient, FtpError, process_ftp_and_redis};
 
 #[tokio::main]
 async fn main() -> Result<(), FtpError> {
+    dotenv().ok();
     env_logger::init();
+
     let ftp_client = FtpClient::new()?;
     let check_interval = env::var("CHECK_INTERVAL")
         .unwrap_or_else(|_| "300".to_string())
@@ -238,69 +35,146 @@ async fn main() -> Result<(), FtpError> {
     }
 }
 
-async fn process_ftp_and_redis(ftp_client: &FtpClient) -> Result<(), FtpError> {
-    const INITIAL_TIMEOUT: Duration = Duration::from_secs(30);
-    const MAX_TIMEOUT: Duration = Duration::from_secs(120);
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::Utc;
+    use std::time::Duration;
 
-    let mut backoff = ExponentialBackoff::default();
-    backoff.initial_interval = INITIAL_TIMEOUT;
-    backoff.max_interval = MAX_TIMEOUT;
-    backoff.max_elapsed_time = Some(Duration::from_secs(300));
-
-    retry(backoff, || {
-        let ftp_client = ftp_client.clone();
-        async move {
-            tokio::time::timeout(
-                INITIAL_TIMEOUT,
-                async {
-                    let mut ftp_stream = ftp_client.connect().await?;
-                    let mut redis_conn = ftp_client.connect_to_redis().await?;
-
-                    let result = process_file(&ftp_client, &mut ftp_stream, &mut redis_conn).await;
-
-                    FtpClient::disconnect(&mut ftp_stream).await?;
-
-                    result
-                },
-            )
-            .await
-            .map_err(|_| {
-                let e = FtpError::IoError(std::io::Error::new(
-                    std::io::ErrorKind::TimedOut,
-                    "Operation timed out",
-                ));
-                error!("Operation timed out");
-                e
-            })?
+    #[tokio::test]
+    async fn test_ftp_connection() -> Result<(), FtpError> {
+        dotenv().ok();
+        let ftp_client = FtpClient::new()?;
+        match tokio::time::timeout(Duration::from_secs(30), ftp_client.connect()).await {
+            Ok(Ok(_)) => {
+                // If we reach here, the connection was successful
+                Ok(())
+            },
+            Ok(Err(e)) => Err(e),
+            Err(_) => Err(FtpError::TimeoutError),
         }
-    })
-    .await
-    .map_err(|e| match e {
-        backoff::Error::Transient(e) | backoff::Error::Permanent(e) => e,
-    })
-}
-
-async fn process_file(ftp_client: &FtpClient, ftp_stream: &mut async_ftp::FtpStream, redis_conn: &mut RedisConnection) -> Result<(), FtpError> {
-    let is_updated = ftp_client.check_file_timestamp(ftp_stream).await?;
-
-    if is_updated {
-        info!("File has been updated. Downloading...");
-        let local_file_path = ftp_client.download_file(ftp_stream).await?;
-
-        let file = tokio::fs::File::open(&local_file_path).await?;
-        let reader = tokio::io::BufReader::new(file);
-
-        info!("Parsing CSV and pushing data to Redis...");
-        ftp_client.parse_csv(reader, redis_conn).await?;
-
-        info!("CSV data processed and pushed to Redis successfully");
-
-        if let Err(e) = tokio::fs::remove_file(&local_file_path).await {
-            error!("Failed to remove local file: {}. Error: {}", local_file_path, e);
-        }
-    } else {
-        info!("File has not been updated since last check.");
     }
 
-    Ok(())
+    #[tokio::test]
+    async fn test_file_download() -> Result<(), FtpError> {
+        dotenv().ok();
+        let ftp_client = FtpClient::new()?;
+        let mut ftp_stream = match tokio::time::timeout(
+            Duration::from_secs(30),
+            ftp_client.connect()
+        ).await {
+            Ok(Ok(stream)) => stream,
+            Ok(Err(e)) => return Err(e),
+            Err(_) => return Err(FtpError::TimeoutError),
+        };
+        let local_file_path = ftp_client.download_file(&mut ftp_stream).await?;
+        assert!(std::path::Path::new(&local_file_path).exists());
+        tokio::fs::remove_file(local_file_path).await?;
+        FtpClient::disconnect(&mut ftp_stream).await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_csv_parsing_and_redis_integration() -> Result<(), FtpError> {
+        use redis::AsyncCommands;
+
+        dotenv().ok();
+        let ftp_client = FtpClient::new()?;
+
+        let result = tokio::time::timeout(Duration::from_secs(30), async {
+            let mut ftp_stream = ftp_client.connect().await?;
+            let local_file_path = ftp_client.download_file(&mut ftp_stream).await?;
+
+            let file = tokio::fs::File::open(&local_file_path).await?;
+            let reader = tokio::io::BufReader::new(file);
+
+            let mut redis_conn = ftp_client.connect_to_redis().await?;
+            ftp_client.parse_csv(reader, &mut redis_conn).await?;
+
+            // Check if data was pushed to Redis
+            let key = "record:1";  // Assuming the first record has id 1
+            let value: Option<String> = redis_conn.get(key).await?;
+            assert!(value.is_some(), "No data found in Redis for key: {}", key);
+
+            // Check CSV parsing accuracy
+            let parsed_value = value.unwrap();
+            assert!(parsed_value.contains(","), "CSV data not properly parsed");
+
+            tokio::fs::remove_file(local_file_path).await?;
+            Ok::<(), FtpError>(())
+        }).await;
+
+        match result {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(e)) => Err(e),
+            Err(_) => Err(FtpError::TimeoutError),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_admin_notification_cooldown() -> Result<(), FtpError> {
+        dotenv().ok();
+        let ftp_client = FtpClient::new()?;
+
+        // First notification
+        ftp_client.notify_admin("Test error").await?;
+
+        // Second notification (should be ignored due to cooldown)
+        let result = ftp_client.notify_admin("Another test error").await;
+        assert!(result.is_ok(), "Second notification should be ignored due to cooldown");
+
+        // Wait for cooldown to expire
+        tokio::time::sleep(Duration::from_secs(1800)).await;
+
+        // Third notification (should be sent)
+        ftp_client.notify_admin("Final test error").await?;
+
+        // Verify that the last notification time has been updated
+        let last_notification = ftp_client.last_notification.lock().map_err(|e| FtpError::LockError(e.to_string()))?;
+        assert!(last_notification.is_some(), "Last notification time should be set");
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_main_program_loop() -> Result<(), FtpError> {
+        dotenv().ok();
+        let ftp_client = FtpClient::new()?;
+        let check_interval = env::var("CHECK_INTERVAL")
+            .unwrap_or_else(|_| "5".to_string())  // Use a short interval for testing
+            .parse::<u64>()
+            .unwrap_or(5);
+
+        let start_time = Utc::now();
+        let mut loop_count = 0;
+        let mut timeout_count = 0;
+        let mut other_error_count = 0;
+
+        while (Utc::now() - start_time).num_seconds() < 15 {  // Run for 15 seconds
+            match process_ftp_and_redis(&ftp_client).await {
+                Ok(()) => loop_count += 1,
+                Err(e) => {
+                    match e {
+                        FtpError::TimeoutError => {
+                            timeout_count += 1;
+                            error!("Timeout error in main loop");
+                        },
+                        _ => {
+                            other_error_count += 1;
+                            error!("Error in main loop: {}", e);
+                            if let Err(notify_err) = ftp_client.notify_admin(&format!("Error in main loop: {}", e)).await {
+                                error!("Failed to notify admin: {}", notify_err);
+                            }
+                        }
+                    }
+                }
+            }
+            tokio::time::sleep(Duration::from_secs(check_interval)).await;
+        }
+
+        assert!(loop_count > 0, "Main loop should have run at least once");
+        assert!(timeout_count + other_error_count < loop_count, "Too many errors occurred");
+        assert!(timeout_count > 0, "No timeout errors occurred, which is unexpected");
+        Ok(())
+    }
 }

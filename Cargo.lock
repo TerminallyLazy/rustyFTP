@@ -93,6 +93,7 @@ dependencies = [
  "instant",
  "pin-project-lite",
  "rand",
+ "tokio",
 ]
 
 [[package]]
@@ -692,7 +693,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "719b953e2095829ee67db738b3bfa9fa368c94900df327b3f07fe6e794d2fe1f"
 
 [[package]]
-name = "rustyFTP"
+name = "rusty-ftp"
 version = "0.1.0"
 dependencies = [
  "async-trait",
@@ -704,6 +705,7 @@ dependencies = [
  "dotenv",
  "env_logger",
  "futures",
+ "futures-util",
  "log",
  "redis",
  "thiserror",

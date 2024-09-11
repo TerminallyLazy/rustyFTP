@@ -1,5 +1,5 @@
 [package]
-name = "rustyFTP"
+name = "rusty-ftp"
 version = "0.1.0"
 edition = "2021"
 
@@ -13,8 +13,9 @@ log = "0.4"
 env_logger = "0.9"
 tokio = { version = "1", features = ["full"] }
 thiserror = "1.0"
-backoff = { version = "0.4", features = ["futures"] }
+backoff = { version = "0.4", features = ["tokio"] }
 futures = "0.3"
 chrono = "0.4"
 async-trait = "0.1"
 tokio-util = { version = "0.7", features = ["compat"] }
+futures-util = "0.3"
